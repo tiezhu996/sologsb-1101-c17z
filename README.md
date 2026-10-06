@@ -70,7 +70,7 @@ npm run preview    # 本地预览构建产物（http://localhost:21801）
 | `/halls` | 殿宇总览 | 新建殿宇、按年代与结构类型筛选，卡片回显病害总数与未修复数 | Hall、Element、PaintLayer、Decay |
 | `/halls/:id/elements` | 构件与层位 | 构件树 + 层位表格，新增构件与层位，挂接病害 | Element、PaintLayer、Decay |
 | `/decays` | 病害档案台 | 按类型 / 程度 / 颜料 / 殿宇 / 部位组合筛选，批量改严重程度与类型 | Decay、PaintLayer |
-| `/repair` | 修复工序时间线 | 拖拽调整工序先后，回填材料与责任人，完成即回写病害为已修复 | RepairStep、Decay |
+| `/repair` | 修复工序时间线 | 拖拽调整工序先后，回填材料与责任人，完成即回写病害为已修复；维护工序模板，按殿宇预览命中病害与生成数量后批量生成 | RepairStep、RepairTemplate、Decay |
 | `/backup` | 本地数据与备份 | 查看本地结构版本、JSON 导入导出、清空与样例数据 | 全部模型 |
 
 `/` 与未匹配路径均重定向到 `/halls`。
@@ -85,9 +85,10 @@ npm run preview    # 本地预览构建产物（http://localhost:21801）
 | Element 构件 | `src/types/element.ts` | `id` `hallId` `position`（檐下/室内/梁枋/斗拱/天花） `name` `layerCount` `baseLayer` `status`（完好/观察/待修） | 按殿宇与部位二维筛选 |
 | PaintLayer 彩画层位 | `src/types/layer.ts` | `id` `elementId` `level`（由外至内） `patternName`（旋子/和玺/苏式） `pigment`（石青/石绿/朱砂/土黄） `thicknessMm` | 层位顺次叠压 |
 | Decay 病害记录 | `src/types/decay.ts` | `id` `layerId` `type`（起甲/剥落/空鼓/粉化/龟裂） `severity`（轻度/中度/重度） `areaCm2` `causeGuess` `repaired` | 同层位可叠加多条并汇总到殿宇 |
-| RepairStep 修复工序 | `src/types/repair.ts` | `id` `decayId` `seq` `name`（除尘/回贴/灌浆/补绘/封护） `material` `operator` `state`（未开始/进行中/已完成） | 拖拽排序，完成回写病害 |
+| RepairStep 修复工序 | `src/types/repair.ts` | `id` `decayId` `seq` `name`（除尘/回贴/灌浆/补绘/封护） `material` `operator` `state`（未开始/进行中/已完成） `templateId` `templateName`（模板生成时的来源快照，可空） | 拖拽排序，完成回写病害 |
+| RepairTemplate 工序模板 | `src/types/repairTemplate.ts` | `id` `name` `steps`（工序顺序+默认材料） `severities`（适用程度，空为不限） `active`（启停） `builtin` | 按殿宇预览命中病害与数量，确认后批量生成 |
 
-数据结构版本号 `DB_VERSION` 定义在 `src/utils/db.ts`，当前为 `v2`：`decays` 表补充 `repairedAt` 索引，并为修复状态缺失的历史数据按 `updatedAt` 回填，升级逻辑写在 Dexie 的 `.upgrade()` 中。
+数据结构版本号 `DB_VERSION` 定义在 `src/utils/db.ts`，当前为 `v3`：新增 `repairTemplates` 模板表，升级时播种三套内置模板（轻度养护 / 中重度修复链 / 空鼓灌浆专项，可编辑、可停用、内置不可删）；`repairSteps` 增加模板来源快照字段，历史工序与旧备份仍可识别。
 
 ---
 
@@ -97,13 +98,14 @@ npm run preview    # 本地预览构建产物（http://localhost:21801）
 sologsb-1101/
 ├── frontend/                     # 前端源码
 │   ├── src/
-│   │   ├── types/                # hall.ts element.ts layer.ts decay.ts repair.ts
-│   │   ├── stores/               # hallStore.ts decayStore.ts repairStore.ts
+│   │   ├── types/                # hall.ts element.ts layer.ts decay.ts repair.ts repairTemplate.ts
+│   │   ├── stores/               # hallStore.ts decayStore.ts repairStore.ts repairTemplateStore.ts
 │   │   ├── components/common/    # SeverityTag.vue FilterBar.vue StatBadge.vue EmptyPanel.vue
+│   │   ├── components/repair/    # TemplateManageDialog.vue TemplateEditDialog.vue TemplateGenerateDialog.vue
 │   │   ├── hooks/                # useDecayFilter.ts useIdbTable.ts
 │   │   ├── pages/                # HallList.vue ElementDetail.vue DecayBoard.vue RepairPlan.vue BackupView.vue
 │   │   ├── router/               # index.ts
-│   │   ├── utils/                # severity.ts db.ts export.ts
+│   │   ├── utils/                # severity.ts db.ts export.ts defaultTemplates.ts
 │   │   ├── styles/               # main.css
 │   │   ├── App.vue main.ts env.d.ts
 │   ├── public/favicon.svg
@@ -122,9 +124,10 @@ sologsb-1101/
 
 ## 七、数据存储说明
 
-- **IndexedDB（Dexie，数据库名 `gbmuralarch`）**：5 张业务表 `halls` / `elements` / `layers` / `decays` / `repairSteps`，由 `src/utils/db.ts` 统一定义 schema、版本号与升级迁移；所有增删改查通过 `src/hooks/useIdbTable.ts` 封装，并用 `liveQuery` 提供响应式订阅。
+- **IndexedDB（Dexie，数据库名 `gbmuralarch`）**：6 张业务表 `halls` / `elements` / `layers` / `decays` / `repairSteps` / `repairTemplates`，由 `src/utils/db.ts` 统一定义 schema、版本号与升级迁移；所有增删改查通过 `src/hooks/useIdbTable.ts` 封装，并用 `liveQuery` 提供响应式订阅。
+- **工序模板与批量生成**：模板含名称、工序顺序、适用程度与默认材料，可在「修复工序 → 模板管理」中维护（内置三套可编辑可停用、不可删除）。批量生成时先按殿宇预览命中的病害与将生成的工序数量，确认后才写入；已有工序的病害不参与，写入内容以模板当时内容为准并在工序上留下模板名称快照，之后修改或停用模板不会重写历史工序。无命中时不写任何数据并说明原因（殿宇无病害 / 全部已有工序 / 程度不在适用范围）。停用模板不能再被选择，但历史工序仍显示来源名称；模板删除与备份导入同样不影响已生成的工序。
 - **localStorage**：仅存元数据 —— `gbmuralarch:db-version`（本地结构版本）、`gbmuralarch:last-backup-at`（最近一次导出时间）、`gbmuralarch:ui-prefs`（当前选中殿宇、工序排序方式）。
-- **备份**：`/backup` 页面可导出 JSON（含 5 张表全量数据与结构版本），导入时先校验 `app` 字段与各集合数组完整性；支持「覆盖导入」与「追加导入（重新分配 id）」两种模式。
+- **备份**：`/backup` 页面可导出 JSON（含 6 张表全量数据与结构版本），导入时先校验 `app` 字段与各集合数组完整性（v2 旧备份缺模板表时按空集合兼容处理）；支持「覆盖导入」与「追加导入（重新分配 id，并同步重映射工序上的模板来源指向）」两种模式。
 - **隐私与无状态**：数据不上传任何服务器，容器不挂载命名卷；清理浏览器站点数据或更换浏览器会丢失档案，请定期导出备份。
 
 ---

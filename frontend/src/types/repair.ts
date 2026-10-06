@@ -11,6 +11,13 @@ export interface RepairStep {
   material: string
   operator: string
   state: RepairState
+  /**
+   * 生成来源快照：由工序模板批量生成时记录。
+   * 模板之后被修改 / 停用 / 删除都不回写这些字段，历史工序仍可识别。
+   * 手工添加的工序无该字段。
+   */
+  templateId?: string
+  templateName?: string
   createdAt: number
   updatedAt: number
 }

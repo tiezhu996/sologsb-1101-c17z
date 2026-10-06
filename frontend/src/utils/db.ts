@@ -4,9 +4,11 @@ import type { Element } from '@/types/element'
 import type { PaintLayer } from '@/types/layer'
 import type { Decay } from '@/types/decay'
 import type { RepairStep } from '@/types/repair'
+import type { RepairTemplate } from '@/types/repairTemplate'
+import { buildDefaultTemplates } from '@/utils/defaultTemplates'
 
 /** 本地结构版本号：新增/修改表结构时必须递增，并补充 upgrade 迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** 本地存储键名（localStorage 侧的少量元数据） */
 export const LS_KEYS = {
@@ -35,6 +37,7 @@ export interface BackupPayload {
   layers: PaintLayer[]
   decays: Decay[]
   repairSteps: RepairStep[]
+  repairTemplates: RepairTemplate[]
 }
 
 export class MuralArchDatabase extends Dexie {
@@ -43,6 +46,7 @@ export class MuralArchDatabase extends Dexie {
   layers!: Table<PaintLayer, string>
   decays!: Table<Decay, string>
   repairSteps!: Table<RepairStep, string>
+  repairTemplates!: Table<RepairTemplate, string>
 
   constructor() {
     super('gbmuralarch')
@@ -54,16 +58,25 @@ export class MuralArchDatabase extends Dexie {
       repairSteps: 'id, decayId, seq, state, updatedAt'
     })
     // v2：病害表补充 repairedAt 索引，工序表补充 name 索引
+    this.version(2).stores({
+      halls: 'id, name, era, structureType, roofType, updatedAt',
+      elements: 'id, hallId, position, status, updatedAt',
+      layers: 'id, elementId, level, patternName, pigment',
+      decays: 'id, layerId, type, severity, repaired, repairedAt, updatedAt',
+      repairSteps: 'id, decayId, seq, name, state, updatedAt'
+    })
+    // v3：新增修复工序模板表（含名称、工序顺序、适用程度、默认材料、启停状态）
     this.version(DB_VERSION)
       .stores({
         halls: 'id, name, era, structureType, roofType, updatedAt',
         elements: 'id, hallId, position, status, updatedAt',
         layers: 'id, elementId, level, patternName, pigment',
         decays: 'id, layerId, type, severity, repaired, repairedAt, updatedAt',
-        repairSteps: 'id, decayId, seq, name, state, updatedAt'
+        repairSteps: 'id, decayId, seq, name, state, updatedAt',
+        repairTemplates: 'id, name, active, updatedAt'
       })
       .upgrade(async (tx) => {
-        // 迁移：历史数据 repaired 为 true 但缺少 repairedAt，用 updatedAt 回填
+        // v2 迁移：历史数据 repaired 为 true 但缺少 repairedAt，用 updatedAt 回填
         await tx
           .table<Decay>('decays')
           .toCollection()
@@ -75,7 +88,14 @@ export class MuralArchDatabase extends Dexie {
               decay.repaired = false
             }
           })
+        // v3 迁移：为既有档案补一套内置工序模板
+        await tx.table<RepairTemplate>('repairTemplates').bulkAdd(buildDefaultTemplates())
       })
+
+    // 首次建库（含清空后重建）时播种内置模板
+    this.on('populate', async (tx) => {
+      await tx.table<RepairTemplate>('repairTemplates').bulkAdd(buildDefaultTemplates())
+    })
   }
 }
 
@@ -91,14 +111,15 @@ export function createId(prefix: string): string {
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.halls, db.elements, db.layers, db.decays, db.repairSteps],
+    [db.halls, db.elements, db.layers, db.decays, db.repairSteps, db.repairTemplates],
     async () => {
       await Promise.all([
         db.halls.clear(),
         db.elements.clear(),
         db.layers.clear(),
         db.decays.clear(),
-        db.repairSteps.clear()
+        db.repairSteps.clear(),
+        db.repairTemplates.clear()
       ])
     }
   )

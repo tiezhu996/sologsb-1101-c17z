@@ -1,10 +1,12 @@
 <script setup lang="ts">
 import { computed, nextTick, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Delete, Edit, MagicStick, Plus, Sort } from '@element-plus/icons-vue'
+import { Delete, Edit, Files, MagicStick, Plus, Sort } from '@element-plus/icons-vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import SeverityTag from '@/components/common/SeverityTag.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
+import TemplateGenerateDialog from '@/components/repair/TemplateGenerateDialog.vue'
+import TemplateManageDialog from '@/components/repair/TemplateManageDialog.vue'
 import { useDecayStore } from '@/stores/decayStore'
 import { useHallStore } from '@/stores/hallStore'
 import { useRepairStore } from '@/stores/repairStore'
@@ -62,9 +64,8 @@ const stepForm = reactive<{
   state: '未开始'
 })
 
-const scratchDialogVisible = ref(false)
-const scratchHallId = ref<string>('')
-const scratchTemplate = ref<RepairStepName[]>(['除尘', '回贴', '灌浆', '补绘', '封护'])
+const generateDialogVisible = ref(false)
+const manageDialogVisible = ref(false)
 
 const hallOptions = computed(() =>
   hallStore.halls.map((hall) => ({ label: `${hall.name}（${hall.era}）`, value: hall.id }))
@@ -213,27 +214,12 @@ async function onDrop(group: RepairGroup, target: RepairStep): Promise<void> {
   ElMessage.success('工序顺序已调整')
 }
 
-async function openScratch(): Promise<void> {
-  scratchHallId.value = hallFilter.value || hallStore.halls[0]?.id || ''
-  scratchDialogVisible.value = true
+async function openGenerate(): Promise<void> {
+  generateDialogVisible.value = true
 }
 
-async function submitScratch(): Promise<void> {
-  if (!scratchHallId.value) {
-    ElMessage.warning('请选择殿宇')
-    return
-  }
-  if (scratchTemplate.value.length === 0) {
-    ElMessage.warning('请至少选择一道工序')
-    return
-  }
-  const count = await repairStore.scaffoldForHall(scratchHallId.value, scratchTemplate.value)
-  scratchDialogVisible.value = false
-  if (count === 0) {
-    ElMessage.info('该殿宇下没有待编排的病害（可能已存在工序）')
-  } else {
-    ElMessage.success(`已为待编排病害生成 ${count} 道工序，可逐条拖拽排序`)
-  }
+function onGenerated(stepCount: number, hitCount: number): void {
+  ElMessage.success(`已为 ${hitCount} 条病害生成 ${stepCount} 道工序，可逐条拖拽排序`)
 }
 
 function handleEmptyAction(): void {
@@ -256,9 +242,9 @@ const stateOptions = REPAIR_STATES
         </p>
       </div>
       <div class="page-title__actions">
-        <el-button :icon="MagicStick" @click="openScratch">按殿宇批量生成工序</el-button>
+        <el-button :icon="Files" @click="manageDialogVisible = true">模板管理</el-button>
+        <el-button type="primary" :icon="MagicStick" @click="openGenerate">按模板批量生成工序</el-button>
         <el-button
-          type="primary"
           :icon="Plus"
           :disabled="pendingDecays.length === 0"
           @click="handleEmptyAction"
@@ -399,6 +385,16 @@ const stateOptions = REPAIR_STATES
             <div class="step-card__body">
               <div class="step-card__title">
                 <strong>{{ step.name }}</strong>
+                <el-tag
+                  v-if="step.templateName"
+                  size="small"
+                  type="primary"
+                  effect="plain"
+                  class="step-card__tpl"
+                  :title="`由模板「${step.templateName}」批量生成（生成时快照，模板后续改动不影响本工序）`"
+                >
+                  模板：{{ step.templateName }}
+                </el-tag>
                 <el-tag size="small" effect="plain" :type="step.state === '已完成' ? 'success' : step.state === '进行中' ? 'warning' : 'info'">
                   {{ step.state }}
                 </el-tag>
@@ -452,9 +448,9 @@ const stateOptions = REPAIR_STATES
             : '可切换殿宇或工序状态筛选条件。'
         "
         :action-text="pendingDecays.length > 0 ? '为待编排病害排工序' : ''"
-        :secondary-text="repairStore.totalSteps > 0 ? '按殿宇批量生成工序' : ''"
+        secondary-text="按模板批量生成工序"
         @action="handleEmptyAction"
-        @secondary="openScratch"
+        @secondary="openGenerate"
       />
     </div>
 
@@ -483,27 +479,12 @@ const stateOptions = REPAIR_STATES
       </template>
     </el-dialog>
 
-    <el-dialog v-model="scratchDialogVisible" title="按殿宇批量生成工序" width="560px">
-      <el-form label-width="110px">
-        <el-form-item label="目标殿宇">
-          <el-select v-model="scratchHallId" class="full-width" placeholder="选择殿宇">
-            <el-option v-for="item in hallOptions" :key="item.value" :label="item.label" :value="item.value" />
-          </el-select>
-        </el-form-item>
-        <el-form-item label="工序模板">
-          <el-checkbox-group v-model="scratchTemplate">
-            <el-checkbox v-for="item in stepNameOptions" :key="item" :value="item">
-              {{ item }}
-            </el-checkbox>
-          </el-checkbox-group>
-        </el-form-item>
-      </el-form>
-      <p class="muted">将为该殿宇下所有尚无工序的病害，按所选模板依次生成工序（状态均为未开始）。</p>
-      <template #footer>
-        <el-button @click="scratchDialogVisible = false">取消</el-button>
-        <el-button type="primary" @click="submitScratch">生成工序</el-button>
-      </template>
-    </el-dialog>
+    <TemplateGenerateDialog
+      v-model:visible="generateDialogVisible"
+      :initial-hall-id="hallFilter"
+      @generated="onGenerated"
+    />
+    <TemplateManageDialog v-model:visible="manageDialogVisible" />
   </div>
 </template>
 
@@ -647,6 +628,13 @@ const stateOptions = REPAIR_STATES
   align-items: center;
   gap: 8px;
   margin-bottom: 6px;
+}
+
+.step-card__tpl {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .step-card__fields {
