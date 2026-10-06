@@ -1,20 +1,50 @@
 <script setup lang="ts">
 import { computed, nextTick, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Delete, Edit, MagicStick, Plus, Sort } from '@element-plus/icons-vue'
+import {
+  ArrowDown,
+  ArrowUp,
+  Delete,
+  Edit,
+  MagicStick,
+  Plus,
+  Sort,
+  Tickets
+} from '@element-plus/icons-vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import SeverityTag from '@/components/common/SeverityTag.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
 import { useDecayStore } from '@/stores/decayStore'
 import { useHallStore } from '@/stores/hallStore'
 import { useRepairStore } from '@/stores/repairStore'
+import { useRepairTemplateStore } from '@/stores/repairTemplateStore'
 import type { RepairGroup } from '@/types/repair'
-import { REPAIR_STATES, REPAIR_STEP_NAMES, type RepairState, type RepairStep, type RepairStepName } from '@/types/repair'
+import {
+  REPAIR_STATES,
+  REPAIR_STEP_NAMES,
+  REPAIR_TEMPLATE_NAME_MAX,
+  REPAIR_TEMPLATE_REMARK_MAX,
+  REPAIR_TEMPLATE_STEP_MATERIAL_MAX,
+  type RepairState,
+  type RepairStep,
+  type RepairStepName,
+  type RepairTemplate,
+  type RepairTemplateDraft
+} from '@/types/repair'
+import { SEVERITIES, type Severity } from '@/types/decay'
+import {
+  createEmptyTemplateDraft,
+  createStepKey,
+  draftFromTemplate,
+  validateTemplateDraft,
+  type TemplateDraftErrors
+} from '@/utils/repairTemplateSeed'
 import { formatArea } from '@/utils/severity'
 
 const hallStore = useHallStore()
 const decayStore = useDecayStore()
 const repairStore = useRepairStore()
+const templateStore = useRepairTemplateStore()
 
 const hallFilter = ref<string>('')
 const stateFilter = ref<RepairState | ''>('')
@@ -62,13 +92,63 @@ const stepForm = reactive<{
   state: '未开始'
 })
 
-const scratchDialogVisible = ref(false)
-const scratchHallId = ref<string>('')
-const scratchTemplate = ref<RepairStepName[]>(['除尘', '回贴', '灌浆', '补绘', '封护'])
+/** ===== 按模板批量生成：选择殿宇与模板 → 预览命中 → 确认写入 ===== */
+const generateDialogVisible = ref(false)
+const generateHallId = ref<string>('')
+const generateTemplateId = ref<string>('')
+const generating = ref(false)
+
+/** ===== 工序模板维护 ===== */
+const templateDialogVisible = ref(false)
+const editorVisible = ref(false)
+const editingTemplateId = ref<string | null>(null)
+const editorDraft = reactive<RepairTemplateDraft>(createEmptyTemplateDraft())
+const editorErrors = reactive<TemplateDraftErrors>({})
+const savingTemplate = ref(false)
 
 const hallOptions = computed(() =>
   hallStore.halls.map((hall) => ({ label: `${hall.name}（${hall.era}）`, value: hall.id }))
 )
+
+const activeTemplateOptions = computed(() =>
+  templateStore.activeTemplates.map((template) => ({
+    label: `${template.name}（适用：${template.severities.join('、')}）`,
+    value: template.id
+  }))
+)
+
+const selectedTemplate = computed<RepairTemplate | null>(
+  () => templateStore.templateById(generateTemplateId.value) ?? null
+)
+
+/** 当前殿宇 + 模板的命中预览（响应式，纯计算不写数据） */
+const preview = computed(() => {
+  if (!generateHallId.value || !generateTemplateId.value) return null
+  return templateStore.preview(generateTemplateId.value, generateHallId.value)
+})
+
+/** 命中预览列表中的一行：病害 + 构件名 */
+interface PreviewHitItem {
+  decay: import('@/types/decay').Decay
+  location: string
+}
+
+/** 命中病害按程度分组展示 */
+const hitGroups = computed<{ severity: Severity; items: PreviewHitItem[] }[]>(() => {
+  if (!preview.value) return []
+  return SEVERITIES.map((severity) => ({
+    severity,
+    items: preview.value!.hits
+      .filter((decay) => decay.severity === severity)
+      .map((decay) => {
+        const row = decayStore.rows.find((item) => item.decay.id === decay.id)
+        return {
+          decay,
+          location: row?.element?.name ?? '构件已删除'
+        }
+      })
+  })).filter((group) => group.items.length > 0)
+})
 
 const groups = computed<RepairGroup[]>(() =>
   repairStore.groups.filter((group) => {
@@ -213,27 +293,152 @@ async function onDrop(group: RepairGroup, target: RepairStep): Promise<void> {
   ElMessage.success('工序顺序已调整')
 }
 
-async function openScratch(): Promise<void> {
-  scratchHallId.value = hallFilter.value || hallStore.halls[0]?.id || ''
-  scratchDialogVisible.value = true
+function openGenerateDialog(): void {
+  generateHallId.value = hallFilter.value || hallStore.halls[0]?.id || ''
+  generateTemplateId.value = templateStore.activeTemplates[0]?.id ?? ''
+  generateDialogVisible.value = true
 }
 
-async function submitScratch(): Promise<void> {
-  if (!scratchHallId.value) {
+/** 确认后按模板当时内容写入；无命中不写数据并说明原因 */
+async function submitGenerate(): Promise<void> {
+  if (!generateHallId.value) {
     ElMessage.warning('请选择殿宇')
     return
   }
-  if (scratchTemplate.value.length === 0) {
-    ElMessage.warning('请至少选择一道工序')
+  if (!generateTemplateId.value) {
+    ElMessage.warning('请选择工序模板')
     return
   }
-  const count = await repairStore.scaffoldForHall(scratchHallId.value, scratchTemplate.value)
-  scratchDialogVisible.value = false
-  if (count === 0) {
-    ElMessage.info('该殿宇下没有待编排的病害（可能已存在工序）')
-  } else {
-    ElMessage.success(`已为待编排病害生成 ${count} 道工序，可逐条拖拽排序`)
+  if (!preview.value || preview.value.hits.length === 0) {
+    ElMessage.warning(noHitReason())
+    return
   }
+  const hallName = hallStore.hallById(generateHallId.value)?.name ?? '该殿宇'
+  const templateName = selectedTemplate.value?.name ?? ''
+  const confirmed = await ElMessageBox.confirm(
+    `将按模板「${templateName}」为「${hallName}」的 ${preview.value.hits.length} 条命中病害生成 ${preview.value.stepCount} 道工序。已有工序不参与，是否继续？`,
+    '确认生成工序',
+    { type: 'info', confirmButtonText: '确认生成', cancelButtonText: '取消' }
+  ).catch(() => false)
+  if (!confirmed) return
+
+  generating.value = true
+  try {
+    const result = await templateStore.generate(generateTemplateId.value, generateHallId.value)
+    if (!result.generated || result.decayCount === 0) {
+      ElMessage.warning(noHitReason())
+      return
+    }
+    // 与时间线殿宇筛选联动，方便生成后立即查看
+    hallFilter.value = generateHallId.value
+    generateDialogVisible.value = false
+    ElMessage.success(`已生成 ${result.stepCount} 道工序（覆盖 ${result.decayCount} 条病害），可逐条调整材料与责任人`)
+  } finally {
+    generating.value = false
+  }
+}
+
+/** 无命中的可读原因：优先殿宇，再模板程度，再已有工序 */
+function noHitReason(): string {
+  if (!generateHallId.value) return '请先选择目标殿宇'
+  const hallName = hallStore.hallById(generateHallId.value)?.name ?? '该殿宇'
+  const totalInHall = decayStore.rows.filter((row) => row.hallId === generateHallId.value).length
+  if (totalInHall === 0) return `「${hallName}」下没有病害记录，未生成任何工序`
+  if (!preview.value) return '请选择工序模板'
+  if (preview.value.missCounts.severityMismatch > 0 && preview.value.missCounts.hasSteps === 0) {
+    const levels = selectedTemplate.value?.severities.join('、') ?? ''
+    return `「${hallName}」没有程度为「${levels}」的病害，未生成任何工序`
+  }
+  if (preview.value.missCounts.hasSteps > 0 && preview.value.missCounts.severityMismatch === 0) {
+    return `「${hallName}」的病害均已安排工序，已有工序不参与模板生成`
+  }
+  return `「${hallName}」没有命中的病害（程度不符或已有工序），未生成任何工序`
+}
+
+function openTemplateDialog(): void {
+  templateDialogVisible.value = true
+}
+
+function openEditorCreate(): void {
+  editingTemplateId.value = null
+  Object.assign(editorDraft, createEmptyTemplateDraft())
+  Object.keys(editorErrors).forEach((key) => delete editorErrors[key as keyof TemplateDraftErrors])
+  editorVisible.value = true
+}
+
+function openEditorEdit(template: RepairTemplate): void {
+  editingTemplateId.value = template.id
+  Object.assign(editorDraft, draftFromTemplate(template))
+  Object.keys(editorErrors).forEach((key) => delete editorErrors[key as keyof TemplateDraftErrors])
+  editorVisible.value = true
+}
+
+function addEditorStep(): void {
+  editorDraft.steps.push({ key: createStepKey(), name: '除尘', material: '' })
+}
+
+function removeEditorStep(index: number): void {
+  editorDraft.steps.splice(index, 1)
+}
+
+function moveEditorStep(index: number, delta: -1 | 1): void {
+  const target = index + delta
+  if (target < 0 || target >= editorDraft.steps.length) return
+  const list = editorDraft.steps
+  ;[list[index], list[target]] = [list[target], list[index]]
+}
+
+async function submitEditor(): Promise<void> {
+  const errors = validateTemplateDraft(editorDraft, templateStore.templates, editingTemplateId.value ?? undefined)
+  editorErrors.name = errors.name
+  editorErrors.severities = errors.severities
+  editorErrors.steps = errors.steps
+  if (errors.name || errors.severities || errors.steps) return
+
+  savingTemplate.value = true
+  try {
+    if (editingTemplateId.value) {
+      await templateStore.updateTemplate(editingTemplateId.value, editorDraft)
+      ElMessage.success('模板已更新；已生成的历史工序保持不变')
+    } else {
+      await templateStore.createTemplate(editorDraft)
+      ElMessage.success('模板已创建')
+    }
+    editorVisible.value = false
+  } finally {
+    savingTemplate.value = false
+  }
+}
+
+async function toggleTemplateActive(template: RepairTemplate): Promise<void> {
+  if (template.active) {
+    const confirmed = await ElMessageBox.confirm(
+      `停用模板「${template.name}」后将不能再选择它生成工序；已生成的历史工序仍保留来源标记。是否停用？`,
+      '停用模板',
+      { type: 'warning', confirmButtonText: '停用', cancelButtonText: '取消' }
+    ).catch(() => false)
+    if (!confirmed) return
+  }
+  await templateStore.setActive(template.id, !template.active)
+  ElMessage.success(template.active ? '模板已停用' : '模板已重新启用')
+  // 若生成对话框中正选着被停用的模板，清空选择以免提交失效模板
+  if (!template.active && generateTemplateId.value === template.id) {
+    generateTemplateId.value = templateStore.activeTemplates[0]?.id ?? ''
+  }
+}
+
+async function removeTemplate(template: RepairTemplate): Promise<void> {
+  const confirmed = await ElMessageBox.confirm(
+    `删除模板「${template.name}」？删除后不能再选择它生成工序，但已生成的历史工序仍保留模板名称快照，备份数据也不受影响。`,
+    '删除模板',
+    { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' }
+  ).catch(() => false)
+  if (!confirmed) return
+  await templateStore.removeTemplate(template.id)
+  if (generateTemplateId.value === template.id) {
+    generateTemplateId.value = templateStore.activeTemplates[0]?.id ?? ''
+  }
+  ElMessage.success('模板已删除，历史工序来源仍可识别')
 }
 
 function handleEmptyAction(): void {
@@ -243,6 +448,7 @@ function handleEmptyAction(): void {
 
 const stepNameOptions = REPAIR_STEP_NAMES
 const stateOptions = REPAIR_STATES
+const severityOptions = SEVERITIES
 </script>
 
 <template>
@@ -256,9 +462,9 @@ const stateOptions = REPAIR_STATES
         </p>
       </div>
       <div class="page-title__actions">
-        <el-button :icon="MagicStick" @click="openScratch">按殿宇批量生成工序</el-button>
+        <el-button :icon="Tickets" @click="openTemplateDialog">工序模板</el-button>
+        <el-button type="primary" :icon="MagicStick" @click="openGenerateDialog">按模板批量生成</el-button>
         <el-button
-          type="primary"
           :icon="Plus"
           :disabled="pendingDecays.length === 0"
           @click="handleEmptyAction"
@@ -399,6 +605,16 @@ const stateOptions = REPAIR_STATES
             <div class="step-card__body">
               <div class="step-card__title">
                 <strong>{{ step.name }}</strong>
+                <el-tag
+                  v-if="step.templateName"
+                  size="small"
+                  effect="plain"
+                  type="warning"
+                  class="step-card__tpl"
+                  :title="`由模板「${step.templateName}」生成，保存的是生成当时的内容`"
+                >
+                  {{ step.templateName }}
+                </el-tag>
                 <el-tag size="small" effect="plain" :type="step.state === '已完成' ? 'success' : step.state === '进行中' ? 'warning' : 'info'">
                   {{ step.state }}
                 </el-tag>
@@ -448,13 +664,13 @@ const stateOptions = REPAIR_STATES
         :title="repairStore.totalSteps === 0 ? '尚未安排修复工序' : '当前筛选下没有工序'"
         :description="
           repairStore.totalSteps === 0
-            ? '从待编排病害开始：为每条病害追加除尘、回贴、灌浆、补绘、封护等工序，并按施工顺序拖拽调整。'
+            ? '可在「工序模板」中维护按病害程度的标准工序链，再按殿宇预览命中病害并批量生成；也可以为单条病害手动追加工序。'
             : '可切换殿宇或工序状态筛选条件。'
         "
         :action-text="pendingDecays.length > 0 ? '为待编排病害排工序' : ''"
-        :secondary-text="repairStore.totalSteps > 0 ? '按殿宇批量生成工序' : ''"
+        :secondary-text="repairStore.totalSteps === 0 ? '按模板批量生成' : ''"
         @action="handleEmptyAction"
-        @secondary="openScratch"
+        @secondary="openGenerateDialog"
       />
     </div>
 
@@ -483,25 +699,221 @@ const stateOptions = REPAIR_STATES
       </template>
     </el-dialog>
 
-    <el-dialog v-model="scratchDialogVisible" title="按殿宇批量生成工序" width="560px">
-      <el-form label-width="110px">
+    <el-dialog v-model="generateDialogVisible" title="按模板批量生成工序" width="720px">
+      <el-form label-width="100px">
         <el-form-item label="目标殿宇">
-          <el-select v-model="scratchHallId" class="full-width" placeholder="选择殿宇">
+          <el-select v-model="generateHallId" class="full-width" placeholder="选择殿宇">
             <el-option v-for="item in hallOptions" :key="item.value" :label="item.label" :value="item.value" />
           </el-select>
         </el-form-item>
         <el-form-item label="工序模板">
-          <el-checkbox-group v-model="scratchTemplate">
-            <el-checkbox v-for="item in stepNameOptions" :key="item" :value="item">
-              {{ item }}
-            </el-checkbox>
-          </el-checkbox-group>
+          <el-select
+            v-model="generateTemplateId"
+            class="full-width"
+            placeholder="选择启用中的模板"
+            :no-data-text="'暂无可用模板，请先在「工序模板」中新建或启用'"
+          >
+            <el-option v-for="item in activeTemplateOptions" :key="item.value" :label="item.label" :value="item.value" />
+          </el-select>
         </el-form-item>
       </el-form>
-      <p class="muted">将为该殿宇下所有尚无工序的病害，按所选模板依次生成工序（状态均为未开始）。</p>
+
+      <div v-if="selectedTemplate" class="tpl-summary">
+        <div class="tpl-summary__head">
+          <strong>{{ selectedTemplate.name }}</strong>
+          <el-tag v-for="level in selectedTemplate.severities" :key="level" size="small" effect="plain">
+            {{ level }}
+          </el-tag>
+        </div>
+        <p class="muted tpl-summary__steps">
+          工序顺序：<template v-for="(step, index) in selectedTemplate.steps" :key="step.key">
+            <span class="tpl-summary__step">{{ index + 1 }}. {{ step.name }}<template v-if="step.material">（{{ step.material }}）</template></span>
+          </template>
+        </p>
+        <p v-if="selectedTemplate.remark" class="muted tpl-summary__remark">{{ selectedTemplate.remark }}</p>
+      </div>
+
+      <div v-if="preview" class="preview-box">
+        <div class="preview-box__head">
+          <span>
+            将命中 <strong class="preview-box__num">{{ preview.hits.length }}</strong> 条病害，
+            每条 {{ preview.stepsPerDecay }} 道工序，共生成
+            <strong class="preview-box__num">{{ preview.stepCount }}</strong> 道工序
+          </span>
+          <el-tag type="info" effect="plain">
+            轻度 {{ preview.severityCounts.轻度 }} / 中度 {{ preview.severityCounts.中度 }} / 重度 {{ preview.severityCounts.重度 }}
+          </el-tag>
+        </div>
+
+        <el-alert
+          v-if="preview.hits.length === 0"
+          :title="noHitReason()"
+          type="warning"
+          :closable="false"
+          show-icon
+          class="preview-box__alert"
+        />
+
+        <div v-if="hitGroups.length > 0" class="preview-hits">
+          <div v-for="group in hitGroups" :key="group.severity" class="preview-hits__group">
+            <div class="preview-hits__title">
+              <SeverityTag :severity="group.severity" size="small" plain />
+              <span class="muted">{{ group.items.length }} 条</span>
+            </div>
+            <el-tag
+              v-for="item in group.items"
+              :key="item.decay.id"
+              type="warning"
+              effect="plain"
+              class="preview-hits__tag"
+            >
+              {{ item.location }} · {{ item.decay.type }} · {{ formatArea(item.decay.areaCm2) }}
+            </el-tag>
+          </div>
+        </div>
+
+        <p v-if="preview.misses.length > 0" class="muted preview-box__miss">
+          本殿宇另有 {{ preview.misses.length }} 条病害不写入：
+          <template v-if="preview.missCounts.hasSteps > 0">{{ preview.missCounts.hasSteps }} 条已有工序</template>
+          <template v-if="preview.missCounts.hasSteps > 0 && preview.missCounts.severityMismatch > 0">；</template>
+          <template v-if="preview.missCounts.severityMismatch > 0">
+            {{ preview.missCounts.severityMismatch }} 条程度不在模板适用范围
+          </template>
+          。已有工序一律不参与。
+        </p>
+      </div>
+
+      <p class="muted">
+        生成时以模板当前内容为准；生成后再修改、停用或删除模板，都不会改动这些工序。
+      </p>
       <template #footer>
-        <el-button @click="scratchDialogVisible = false">取消</el-button>
-        <el-button type="primary" @click="submitScratch">生成工序</el-button>
+        <el-button @click="generateDialogVisible = false">取消</el-button>
+        <el-button
+          type="primary"
+          :loading="generating"
+          :disabled="!preview || preview.hits.length === 0"
+          @click="submitGenerate"
+        >
+          确认生成
+        </el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="templateDialogVisible" title="工序模板维护" width="780px">
+      <div class="tpl-manage__head">
+        <span class="muted">停用或删除模板不影响已生成的历史工序，其来源标记与备份仍可识别。</span>
+        <el-button type="primary" size="small" :icon="Plus" @click="openEditorCreate">新建模板</el-button>
+      </div>
+
+      <el-empty v-if="templateStore.templates.length === 0" description="还没有工序模板，先新建一个" />
+      <el-table v-else :data="templateStore.templates" size="small" class="tpl-manage__table">
+        <el-table-column label="模板名称" min-width="150">
+          <template #default="{ row }">
+            <strong>{{ row.name }}</strong>
+            <el-tag v-if="row.builtin" size="small" type="info" effect="plain" class="tpl-manage__builtin">内置</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="适用程度" width="170">
+          <template #default="{ row }">
+            <el-tag v-for="level in row.severities" :key="level" size="small" effect="plain" class="tpl-manage__sev">
+              {{ level }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="工序顺序" min-width="220">
+          <template #default="{ row }">
+            <span v-for="(step, index) in row.steps" :key="step.key" class="tpl-manage__step">
+              {{ index + 1 }}.{{ step.name }}
+            </span>
+          </template>
+        </el-table-column>
+        <el-table-column label="状态" width="90">
+          <template #default="{ row }">
+            <el-tag :type="row.active ? 'success' : 'info'" size="small" effect="plain">
+              {{ row.active ? '启用中' : '已停用' }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" width="170" align="right">
+          <template #default="{ row }">
+            <el-button size="small" text :icon="Edit" @click="openEditorEdit(row)">编辑</el-button>
+            <el-button size="small" text @click="toggleTemplateActive(row)">
+              {{ row.active ? '停用' : '启用' }}
+            </el-button>
+            <el-button size="small" text type="danger" @click="removeTemplate(row)">删除</el-button>
+          </template>
+        </el-table-column>
+      </el-table>
+
+      <template #footer>
+        <el-button @click="templateDialogVisible = false">关闭</el-button>
+        <el-button type="primary" :icon="Plus" @click="openEditorCreate">新建模板</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog
+      v-model="editorVisible"
+      :title="editingTemplateId ? '编辑工序模板' : '新建工序模板'"
+      width="640px"
+      append-to-body
+    >
+      <el-form label-width="100px">
+        <el-form-item label="模板名称" :error="editorErrors.name">
+          <el-input
+            v-model="editorDraft.name"
+            :maxlength="REPAIR_TEMPLATE_NAME_MAX"
+            show-word-limit
+            placeholder="如：重度起甲抢救工序"
+          />
+        </el-form-item>
+        <el-form-item label="适用程度" :error="editorErrors.severities">
+          <el-checkbox-group v-model="editorDraft.severities">
+            <el-checkbox v-for="level in severityOptions" :key="level" :value="level">{{ level }}</el-checkbox>
+          </el-checkbox-group>
+        </el-form-item>
+        <el-form-item label="工序顺序" :error="editorErrors.steps">
+          <div class="tpl-editor__steps">
+            <div v-for="(step, index) in editorDraft.steps" :key="step.key" class="tpl-editor__row">
+              <span class="tpl-editor__seq">{{ index + 1 }}</span>
+              <el-select v-model="step.name" class="tpl-editor__name">
+                <el-option v-for="item in stepNameOptions" :key="item" :label="item" :value="item" />
+              </el-select>
+              <el-input
+                v-model="step.material"
+                class="tpl-editor__material"
+                :maxlength="REPAIR_TEMPLATE_STEP_MATERIAL_MAX"
+                placeholder="默认材料 / 配比（可空）"
+              />
+              <el-button-group>
+                <el-button :icon="ArrowUp" :disabled="index === 0" @click="moveEditorStep(index, -1)" />
+                <el-button
+                  :icon="ArrowDown"
+                  :disabled="index === editorDraft.steps.length - 1"
+                  @click="moveEditorStep(index, 1)"
+                />
+                <el-button type="danger" :icon="Delete" @click="removeEditorStep(index)" />
+              </el-button-group>
+            </div>
+            <el-button size="small" :icon="Plus" @click="addEditorStep">追加一道工序</el-button>
+          </div>
+        </el-form-item>
+        <el-form-item label="备注">
+          <el-input
+            v-model="editorDraft.remark"
+            type="textarea"
+            :rows="2"
+            :maxlength="REPAIR_TEMPLATE_REMARK_MAX"
+            show-word-limit
+            placeholder="适用病害、工艺注意事项等（可空）"
+          />
+        </el-form-item>
+      </el-form>
+      <p v-if="editingTemplateId" class="muted">
+        保存后只影响之后新生成的工序；此前已由该模板生成的工序保持当时内容不变。
+      </p>
+      <template #footer>
+        <el-button @click="editorVisible = false">取消</el-button>
+        <el-button type="primary" :loading="savingTemplate" @click="submitEditor">保存模板</el-button>
       </template>
     </el-dialog>
   </div>
@@ -676,5 +1088,149 @@ const stateOptions = REPAIR_STATES
 
 .full-width {
   width: 100%;
+}
+
+.step-card__tpl {
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tpl-summary {
+  margin: 4px 0 12px;
+  padding: 10px 14px;
+  background: #faf7f1;
+  border: 1px dashed #ddd3c2;
+  border-radius: 10px;
+}
+
+.tpl-summary__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.tpl-summary__steps {
+  margin: 8px 0 0;
+  line-height: 1.9;
+}
+
+.tpl-summary__step {
+  display: inline-block;
+  margin-right: 14px;
+}
+
+.tpl-summary__remark {
+  margin: 4px 0 0;
+  font-size: 12px;
+}
+
+.preview-box {
+  margin: 4px 0 12px;
+  padding: 12px 14px;
+  background: #fbf9f5;
+  border: 1px solid #e7ddcd;
+  border-radius: 10px;
+}
+
+.preview-box__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.preview-box__num {
+  font-size: 16px;
+  color: #8a5a2b;
+}
+
+.preview-box__alert {
+  margin-top: 10px;
+}
+
+.preview-hits {
+  margin-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.preview-hits__title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.preview-hits__tag {
+  margin: 0 8px 6px 0;
+}
+
+.preview-box__miss {
+  margin: 10px 0 0;
+  font-size: 12px;
+}
+
+.tpl-manage__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.tpl-manage__builtin {
+  margin-left: 6px;
+}
+
+.tpl-manage__sev {
+  margin-right: 4px;
+}
+
+.tpl-manage__step {
+  display: inline-block;
+  margin-right: 10px;
+  font-size: 12px;
+  color: #6b6257;
+}
+
+.tpl-editor__steps {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+}
+
+.tpl-editor__row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.tpl-editor__seq {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: #8a5a2b;
+  color: #fff;
+  font-size: 12px;
+  flex: none;
+}
+
+.tpl-editor__name {
+  width: 110px;
+  flex: none;
+}
+
+.tpl-editor__material {
+  flex: 1;
+  min-width: 0;
 }
 </style>

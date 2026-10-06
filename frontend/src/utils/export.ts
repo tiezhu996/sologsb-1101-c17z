@@ -34,19 +34,27 @@ export function validateBackup(input: unknown): { ok: boolean; errors: string[];
     elements: obj.elements ?? [],
     layers: obj.layers ?? [],
     decays: obj.decays ?? [],
-    repairSteps: obj.repairSteps ?? []
+    // v3 以前的备份没有模板表：导入后为空，由 ensureDefaultTemplates 补内置模板
+    repairTemplates: Array.isArray(obj.repairTemplates) ? obj.repairTemplates : [],
+    // 旧备份中的工序缺少来源快照字段，补 null 以保持类型完整
+    repairSteps: (obj.repairSteps ?? []).map((step) => ({
+      ...step,
+      templateId: step.templateId ?? null,
+      templateName: step.templateName ?? null
+    }))
   }
   return { ok: true, errors, payload }
 }
 
 /** 组装当前本地数据的备份对象 */
 export async function buildBackupPayload(): Promise<BackupPayload> {
-  const [halls, elements, layers, decays, repairSteps] = await Promise.all([
+  const [halls, elements, layers, decays, repairSteps, repairTemplates] = await Promise.all([
     db.halls.toArray(),
     db.elements.toArray(),
     db.layers.toArray(),
     db.decays.toArray(),
-    db.repairSteps.toArray()
+    db.repairSteps.toArray(),
+    db.repairTemplates.toArray()
   ])
   return {
     app: 'gbmuralarch',
@@ -56,7 +64,8 @@ export async function buildBackupPayload(): Promise<BackupPayload> {
     elements,
     layers,
     decays,
-    repairSteps
+    repairSteps,
+    repairTemplates
   }
 }
 
@@ -81,7 +90,8 @@ export async function exportBackupJson(): Promise<{ fileName: string; counts: Re
       elements: payload.elements.length,
       layers: payload.layers.length,
       decays: payload.decays.length,
-      repairSteps: payload.repairSteps.length
+      repairSteps: payload.repairSteps.length,
+      repairTemplates: payload.repairTemplates.length
     }
   }
 }
@@ -104,13 +114,14 @@ export async function importBackup(
   if (overwrite) await clearAllTables()
   await db.transaction(
     'rw',
-    [db.halls, db.elements, db.layers, db.decays, db.repairSteps],
+    [db.halls, db.elements, db.layers, db.decays, db.repairSteps, db.repairTemplates],
     async () => {
       await db.halls.bulkPut(payload.halls)
       await db.elements.bulkPut(payload.elements)
       await db.layers.bulkPut(payload.layers)
       await db.decays.bulkPut(payload.decays)
       await db.repairSteps.bulkPut(payload.repairSteps)
+      await db.repairTemplates.bulkPut(payload.repairTemplates)
     }
   )
   return {
@@ -118,7 +129,8 @@ export async function importBackup(
     elements: payload.elements.length,
     layers: payload.layers.length,
     decays: payload.decays.length,
-    repairSteps: payload.repairSteps.length
+    repairSteps: payload.repairSteps.length,
+    repairTemplates: payload.repairTemplates.length
   }
 }
 
@@ -128,6 +140,7 @@ export function remapIds(payload: BackupPayload): BackupPayload {
   const elementIdMap = new Map<string, string>()
   const layerIdMap = new Map<string, string>()
   const decayIdMap = new Map<string, string>()
+  const templateIdMap = new Map<string, string>()
 
   const halls = payload.halls.map((hall) => {
     const id = createId('hall')
@@ -149,12 +162,28 @@ export function remapIds(payload: BackupPayload): BackupPayload {
     decayIdMap.set(decay.id, id)
     return { ...decay, id, layerId: layerIdMap.get(decay.layerId) ?? decay.layerId }
   })
+  // 模板整体作为副本导入：重分配 id，模板内工序条目 key 一并刷新
+  const repairTemplates = payload.repairTemplates.map((template) => {
+    const id = createId('tpl')
+    templateIdMap.set(template.id, id)
+    return {
+      ...template,
+      id,
+      builtin: false,
+      steps: template.steps.map((step) => ({
+        ...step,
+        key: `${id}_${Math.random().toString(36).slice(2, 8)}`
+      }))
+    }
+  })
   const repairSteps = payload.repairSteps.map((step) => ({
     ...step,
     id: createId('step'),
-    decayId: decayIdMap.get(step.decayId) ?? step.decayId
+    decayId: decayIdMap.get(step.decayId) ?? step.decayId,
+    // 工序保留来源名称快照；来源模板随副本导入时指向新模板 id，否则仅留名称快照
+    templateId: step.templateId ? templateIdMap.get(step.templateId) ?? null : null
   }))
-  return { ...payload, halls, elements, layers, decays, repairSteps }
+  return { ...payload, halls, elements, layers, decays, repairSteps, repairTemplates }
 }
 
 /** 生成演示样例数据，便于首次打开即可看到完整链路 */
@@ -259,6 +288,8 @@ export async function seedDemoData(): Promise<void> {
           material: '软毛刷 + 去离子水',
           operator: '李文博',
           state: '已完成',
+          templateId: null,
+          templateName: null,
           createdAt: now,
           updatedAt: now
         },
@@ -270,6 +301,8 @@ export async function seedDemoData(): Promise<void> {
           material: '鱼鳔胶（2% 明矾水调和）',
           operator: '李文博',
           state: '进行中',
+          templateId: null,
+          templateName: null,
           createdAt: now,
           updatedAt: now
         }

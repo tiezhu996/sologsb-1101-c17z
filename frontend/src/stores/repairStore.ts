@@ -122,7 +122,9 @@ export const useRepairStore = defineStore('repair', () => {
         name: payload.name,
         material: payload.material,
         operator: payload.operator,
-        state: payload.state ?? '未开始'
+        state: payload.state ?? '未开始',
+        templateId: null,
+        templateName: null
       },
       'step'
     )
@@ -197,32 +199,6 @@ export const useRepairStore = defineStore('repair', () => {
     })
   }
 
-  /** 一键为某殿宇下所有未修复病害补齐标准工序链 */
-  async function scaffoldForHall(hallId: string, template: RepairStepName[]): Promise<number> {
-    const targets = decayStore.rows.filter(
-      (row) => row.hallId === hallId && !steps.value.some((step) => step.decayId === row.decay.id)
-    )
-    const now = Date.now()
-    const records: RepairStep[] = []
-    targets.forEach((row) => {
-      template.forEach((name, index) => {
-        records.push({
-          id: `${row.decay.id}_${index}_${Math.random().toString(36).slice(2, 7)}`,
-          decayId: row.decay.id,
-          seq: index + 1,
-          name,
-          material: '',
-          operator: '',
-          state: '未开始',
-          createdAt: now,
-          updatedAt: now
-        })
-      })
-    })
-    if (records.length > 0) await db.repairSteps.bulkPut(records)
-    return records.length
-  }
-
   /** 工序分组所属殿宇，用于时间线标题回显 */
   function hallOfGroup(group: RepairGroup): Hall | null {
     const hallId = group.element?.hallId
@@ -253,7 +229,6 @@ export const useRepairStore = defineStore('repair', () => {
     reorder,
     setStepState,
     syncDecayState,
-    normalizeSeq,
-    scaffoldForHall
+    normalizeSeq
   }
 })
